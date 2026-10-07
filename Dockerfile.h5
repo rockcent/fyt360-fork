@@ -1,0 +1,14 @@
+# FYT360 H5 开发镜像（uni-app h5）
+FROM node:20-alpine
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+COPY apps/h5/package.json ./apps/h5/
+RUN npm install --workspace apps/h5 --include-workspace-root --include=dev
+
+COPY apps/h5 ./apps/h5
+COPY packages ./packages
+
+EXPOSE 5173
+WORKDIR /app/apps/h5
+CMD ["node", "scripts/build.mjs"]

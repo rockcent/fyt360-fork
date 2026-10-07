@@ -1,0 +1,17 @@
+# FYT360 API Server 开发镜像（tsx watch 热重载）
+FROM node:20-alpine
+WORKDIR /app
+
+# 装根 workspace 依赖 + server 依赖
+COPY package.json package-lock.json ./
+COPY server/package.json ./server/
+RUN npm install --workspace server --include-workspace-root
+
+# 拷贝源码
+COPY server ./server
+COPY packages ./packages
+COPY deploy ./deploy
+
+EXPOSE 9000
+WORKDIR /app/server
+CMD ["npx", "tsx", "watch", "src/index.ts"]

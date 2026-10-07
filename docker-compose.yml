@@ -1,0 +1,85 @@
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: fyt360-pg
+    environment:
+      POSTGRES_DB: fyt360
+      POSTGRES_USER: fyt360
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-fyt360_dev_password}
+    ports:
+      - "5433:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fyt360 -d fyt360"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    container_name: fyt360-server
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgresql://fyt360:${PG_PASSWORD:-fyt360_dev_password}@postgres:5432/fyt360
+      JWT_SECRET: ${JWT_SECRET:-dev_jwt_secret_change_in_production_32_chars_min}
+      PORT: 9000
+      # CloudBase 相关（本地开发可留空，相关功能会降级）
+      TCB_SECRET_ID: ${TCB_SECRET_ID:-}
+      TCB_SECRET_KEY: ${TCB_SECRET_KEY:-}
+      TCB_ENV_ID: ${TCB_ENV_ID:-}
+      # 微信配置（本地开发可留空）
+      WX_APPID: ${WX_APPID:-}
+      WX_SECRET: ${WX_SECRET:-}
+      WX_MCH_ID: ${WX_MCH_ID:-}
+      WX_API_V3_KEY: ${WX_API_V3_KEY:-}
+    ports:
+      - "9000:9000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./server:/app/server:cached
+      - ./packages:/app/packages:cached
+      - ./deploy:/app/deploy:cached
+    command: >
+      sh -c "
+        cd /app/server &&
+        npm run dev
+      "
+
+  admin:
+    build:
+      context: .
+      dockerfile: Dockerfile.admin
+    container_name: fyt360-admin
+    environment:
+      NODE_ENV: development
+      VITE_API_BASE: http://server:9000
+    ports:
+      - "5173:5173"
+    depends_on:
+      - server
+
+  h5:
+    build:
+      context: .
+      dockerfile: Dockerfile.h5
+    container_name: fyt360-h5
+    environment:
+      NODE_ENV: development
+      VITE_API_BASE: http://server:9000
+    ports:
+      - "5174:5173"
+    depends_on:
+      - server
+
+volumes:
+  pg_data:
+
+networks:
+  default:
+    name: fyt360-net

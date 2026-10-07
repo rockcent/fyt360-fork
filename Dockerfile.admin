@@ -1,0 +1,13 @@
+# FYT360 Admin 后台开发镜像（vite 热重载）
+FROM node:20-alpine
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+COPY apps/admin/package.json ./apps/admin/
+RUN npm install --workspace apps/admin --include-workspace-root --include=dev
+
+COPY apps/admin ./apps/admin
+
+EXPOSE 5173
+WORKDIR /app/apps/admin
+CMD ["/app/node_modules/.bin/vite", "--host", "0.0.0.0", "--port", "5173"]
