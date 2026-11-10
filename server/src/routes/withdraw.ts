@@ -5,9 +5,32 @@
 import { Router, type Request, type Response, type NextFunction } from 'express';
 import { pool } from '../db/client.js';
 import { HttpError } from '../middleware/errors.js';
-import { requireAdmin, type AdminJwtPayload } from '../middleware/auth.js';
+import { requireAdmin, assertSiteAccess, type AdminJwtPayload } from '../middleware/auth.js';
 
 export const withdrawRouter = Router();
+
+/** 提现单归属：withdraw 自身无 site_id，归属由 user.site_id 推导（与列表查询同源）。
+ *  2026-11-10 P0 修复：approve/reject/batch-pay 原仅按自增 id 定位，
+ *  B 站管理员可跨站将他站提现单标记「已打款」或驳回退回余额（动态复现均为 200）。
+ *  先查归属 → assertSiteAccess → 写语句再带站点条件（防 TOCTOU）。 */
+async function loadWithdrawOwnership(admin: AdminJwtPayload, id: number): Promise<string> {
+  const { rows } = await pool.query(
+    `SELECT u.site_id::text AS site_id
+       FROM withdraw w JOIN "user" u ON u.user_id = w.user_id
+      WHERE w.id = $1::bigint LIMIT 1`,
+    [id]
+  );
+  if (!rows[0]) throw new HttpError(404, '提现单不存在', 'WITHDRAW_NOT_FOUND');
+  const siteId = String(rows[0].site_id);
+  assertSiteAccess(admin, siteId);
+  return siteId;
+}
+
+function withdrawId(raw: string): number {
+  const id = Number(raw);
+  if (!Number.isInteger(id) || id <= 0) throw new HttpError(400, '提现单 id 非法', 'BAD_REQUEST');
+  return id;
+}
 
 /** 站点范围：active 站点头/参数 → 单站；否则平台=全站、站点角色=自身站点 */
 async function scope(admin: AdminJwtPayload, code: string): Promise<string[]> {
@@ -129,10 +152,14 @@ withdrawRouter.get('/', requireAdmin, async (req: Request, res: Response, next: 
 /** POST /api/admin/withdraw/:id/approve → 通过打款（pending → paid，记 audit/paid_at） */
 withdrawRouter.post('/:id/approve', requireAdmin, async (req: Request, res: Response, next: NextFunction) => {
   try {
+    const id = withdrawId(req.params.id);
+    const siteId = await loadWithdrawOwnership(req.admin!, id);
     const { rows } = await pool.query(
       `UPDATE withdraw SET status = 'paid', audit_by = $2::bigint, audit_at = now(), paid_at = now(), reject_reason = NULL
-        WHERE id = $1::bigint AND status = 'pending' RETURNING id`,
-      [Number(req.params.id), req.admin!.adminId]
+        WHERE id = $1::bigint AND status = 'pending'
+          AND user_id IN (SELECT user_id FROM "user" WHERE site_id = $3::uuid)
+        RETURNING id`,
+      [id, req.admin!.adminId, siteId]
     );
     if (!rows[0]) throw new HttpError(404, '记录不存在或状态不可打款', 'WITHDRAW_NOT_PENDING');
     res.json({ ok: true, data: { id: Number(rows[0].id), status: 'paid' } });
@@ -142,6 +169,8 @@ withdrawRouter.post('/:id/approve', requireAdmin, async (req: Request, res: Resp
 /** POST /api/admin/withdraw/:id/reject {reason} → 驳回（pending → rejected） */
 withdrawRouter.post('/:id/reject', requireAdmin, async (req: Request, res: Response, next: NextFunction) => {
   try {
+    const id = withdrawId(req.params.id);
+    const siteId = await loadWithdrawOwnership(req.admin!, id);
     const reason = String(req.body?.reason ?? '').trim();
     if (!reason) throw new HttpError(400, '请填写驳回原因', 'BAD_REQUEST');
     // 驳回退回余额（C 端申请时已原子扣减 promoter.commission_balance，闭环）
@@ -149,6 +178,7 @@ withdrawRouter.post('/:id/reject', requireAdmin, async (req: Request, res: Respo
       `WITH rej AS (
          UPDATE withdraw SET status = 'rejected', audit_by = $2::bigint, audit_at = now(), reject_reason = $3
           WHERE id = $1::bigint AND status = 'pending'
+            AND user_id IN (SELECT user_id FROM "user" WHERE site_id = $4::uuid)
          RETURNING id, user_id, amount
        ), back AS (
          UPDATE promoter SET commission_balance = commission_balance + rej.amount
@@ -156,7 +186,7 @@ withdrawRouter.post('/:id/reject', requireAdmin, async (req: Request, res: Respo
          RETURNING 1
        )
        SELECT id, (SELECT count(*)::int FROM back) AS refunded FROM rej`,
-      [Number(req.params.id), req.admin!.adminId, reason.slice(0, 255)]
+      [id, req.admin!.adminId, reason.slice(0, 255), siteId]
     );
     if (!rows[0]) throw new HttpError(404, '记录不存在或状态不可驳回', 'WITHDRAW_NOT_PENDING');
     res.json({ ok: true, data: { id: Number(rows[0].id), status: 'rejected' } });
@@ -166,12 +196,21 @@ withdrawRouter.post('/:id/reject', requireAdmin, async (req: Request, res: Respo
 /** POST /api/admin/withdraw/batch-pay {ids} → 批量打款（仅 pending 生效） */
 withdrawRouter.post('/batch-pay', requireAdmin, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(Number).filter(Number.isFinite) : [];
+    const ids = Array.isArray(req.body?.ids)
+      ? req.body.ids.map(Number).filter((n: number) => Number.isInteger(n) && n > 0) : [];
     if (!ids.length) throw new HttpError(400, '缺少提现单 ID', 'BAD_REQUEST');
+    // 整批 fail-closed：任一单不属于管理员可见站点 → 整批 403，不做部分更新
+    const siteIds: string[] = [];
+    for (const id of ids) {
+      const sid = await loadWithdrawOwnership(req.admin!, id);
+      if (!siteIds.includes(sid)) siteIds.push(sid);
+    }
     const { rows } = await pool.query(
       `UPDATE withdraw SET status = 'paid', audit_by = $1::bigint, audit_at = now(), paid_at = now()
-        WHERE id = ANY($2::int[]) AND status = 'pending' RETURNING id`,
-      [req.admin!.adminId, ids]
+        WHERE id = ANY($2::bigint[]) AND status = 'pending'
+          AND user_id IN (SELECT user_id FROM "user" WHERE site_id = ANY($3::uuid[]))
+        RETURNING id`,
+      [req.admin!.adminId, ids, siteIds]
     );
     res.json({ ok: true, data: { paid: rows.length } });
   } catch (e) { next(e); }

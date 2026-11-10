@@ -158,7 +158,8 @@ schemaRouter.put('/draft', requireAdmin, async (req: Request, res: Response, nex
     const tdoc = trow[0]?.schema_json as { title?: unknown } | undefined;
     if (tdoc && typeof tdoc.title === 'string') inheritTitle = { title: tdoc.title };
 
-    const doc = JSON.stringify({ page, floors: req.body?.floors, ...inheritTitle });
+    // page-v1 信封：与 default-home.json / 003 / 004 / 041 约束保持同一结构真源
+    const doc = JSON.stringify({ version: 1, page, floors: req.body?.floors, ...inheritTitle });
     const { rows: exist } = await pool.query(
       `SELECT id, version FROM page_schema
         WHERE site_id = $1::uuid AND page = $2::text AND status = 'draft' LIMIT 1`, [siteId, page]);

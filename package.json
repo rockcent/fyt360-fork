@@ -16,7 +16,8 @@
     "seed": "node deploy/scripts/seed.mjs",
     "deploy": "node deploy/scripts/deploy.mjs",
     "verify:local": "node deploy/scripts/verify-local.mjs",
-    "verify:api": "node deploy/scripts/verify-api.mjs"
+    "verify:api": "node deploy/scripts/verify-api.mjs",
+    "ci:gate": "bash deploy/scripts/ci-gate.sh"
   },
   "engines": {
     "node": ">=20"

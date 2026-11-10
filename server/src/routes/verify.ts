@@ -7,6 +7,17 @@ import { requireAdmin, assertSiteAccess, type AdminJwtPayload } from '../middlew
 
 export const verifyRouter = Router();
 
+/** 核销员归属（2026-11-10 P1 修复）：原 PATCH 仅按 id 定位 verify_agent，
+ *  B 站管理员可跨站改他站核销员角色/状态。读资源 site_id → 校验 → 写语句带站点条件。 */
+async function loadAgentOwnership(admin: AdminJwtPayload, id: number): Promise<string> {
+  const { rows } = await pool.query(
+    `SELECT site_id::text AS site_id FROM verify_agent WHERE id = $1::bigint LIMIT 1`, [id]);
+  if (!rows[0]) throw new HttpError(404, '核销员不存在', 'AGENT_NOT_FOUND');
+  const siteId = String(rows[0].site_id);
+  assertSiteAccess(admin, siteId);
+  return siteId;
+}
+
 async function oneSite(admin: AdminJwtPayload, code: string): Promise<string> {
   if (code) {
     const { rows } = await pool.query(`SELECT site_id FROM site WHERE code = $1 LIMIT 1`, [code]);
@@ -170,13 +181,19 @@ verifyRouter.post('/agents', requireAdmin, async (req: Request, res: Response, n
 /** PATCH /api/admin/verify/agents/:id {role,status} → 调整核销员 */
 verifyRouter.patch('/agents/:id', requireAdmin, async (req: Request, res: Response, next: NextFunction) => {
   try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) throw new HttpError(400, '核销员 id 非法', 'BAD_REQUEST');
+    const siteId = await loadAgentOwnership(req.admin!, id);
     const sets: string[] = [];
     const params: unknown[] = [];
     if (req.body?.role !== undefined) { params.push(req.body.role === 'manager' ? 'manager' : 'verifier'); sets.push(`role = $${params.length}`); }
     if (req.body?.status !== undefined) { params.push(req.body.status === 'disabled' ? 'disabled' : 'active'); sets.push(`status = $${params.length}`); }
     if (!sets.length) throw new HttpError(400, '无可更新字段', 'BAD_REQUEST');
-    params.push(Number(req.params.id));
-    const { rows } = await pool.query(`UPDATE verify_agent SET ${sets.join(', ')} WHERE id = $${params.length}::bigint RETURNING id`, params);
+    params.push(id, siteId);
+    const { rows } = await pool.query(
+      `UPDATE verify_agent SET ${sets.join(', ')}
+        WHERE id = $${params.length - 1}::bigint AND site_id = $${params.length}::uuid
+        RETURNING id`, params);
     if (!rows[0]) throw new HttpError(404, '核销员不存在', 'AGENT_NOT_FOUND');
     res.json({ ok: true, data: { id: Number(rows[0].id) } });
   } catch (e) { next(e); }

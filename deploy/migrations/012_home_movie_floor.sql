@@ -1,24 +1,46 @@
 -- 012: 首页追加影票热映楼层（2026-09-27，D先生 确认排入默认首页）
--- 仅对 published 的 home 追加 movie-box 楼层（置于商品流之前），幂等：已有 movie-box 楼层则跳过
--- 楼层定义与 packages/renderer/schema/default-home.json 的 f-movie 保持同源
+-- 唯一结构合同 = packages/renderer/schema/page-v1.schema.json
+-- 唯一内容真源 = packages/renderer/schema/default-home.json（7 层，含 f-movie）
+-- 楼层定义与真源的 f-movie 保持同源
 --
--- 2026-11-10 修复：首页 schema 存在两种形态——
---   003/004 写入的是信封 {"version":1,"page":"home","floors":[…]}
---   deploy/scripts/seed.mjs §8 写入的是根级数组 [{component_id,…}]（无 floors 键）
--- 原实现对根级数组取 schema_json->'floors' 得到 NULL，jsonb_set 写入 NULL 后触发
--- page_schema.schema_json NOT NULL 违约，空库或「先 seed 再迁移」的库会整条迁移链中断。
--- 现改为：只处理信封结构，其余结构跳过并告警，不再让缺键变成硬失败。
+-- 2026-11-10 彻底治理：
+--   历史上存在两种形态：003/004 写信封 {"version","page","floors":[…]}，
+--   deploy/scripts/seed.mjs §8 曾写根级数组 [{…}]（现已改为读同一真源）。
+--   原实现对根级数组取 ->'floors' 得 NULL，jsonb_set 写 NULL 触发
+--   page_schema.schema_json NOT NULL 违约，空库/先 seed 的库整条迁移链中断。
+--   上一轮修复是「跳过非信封」，会静默丢影票楼层；本轮改为「先自愈规范化再注入」。
+--   ⚠️ migrate.mjs 每次全量重跑全部 SQL（无迁移记录表），因此本迁移本身就是
+--      升级路径的收敛点；041 再加数据库 CHECK 约束把结构锁死，形成双保险。
 DO $$
-DECLARE n int; skipped int;
+DECLARE n int; fixed int; fixed2 int;
 BEGIN
-  SELECT count(*) INTO skipped
-    FROM page_schema
-   WHERE page = 'home' AND status = 'published'
+  -- ① 自愈：历史根级数组 → page-v1 信封（幂等，第二次命中 0 行）
+  UPDATE page_schema
+     SET schema_json = jsonb_build_object(
+           'version', 1,
+           'page', page,
+           'floors', schema_json
+         ),
+         updated_at = now()
+   WHERE jsonb_typeof(schema_json) = 'array';
+  GET DIAGNOSTICS fixed = ROW_COUNT;
+
+  -- ② 补 page / floors 键（DIY 草稿、AI 新建页曾写 {floors:[…]} 或 {} 形态）
+  UPDATE page_schema
+     SET schema_json = jsonb_set(schema_json, '{page}', to_jsonb(page), true)
+   WHERE jsonb_typeof(schema_json) = 'object'
+     AND NOT (schema_json ? 'page');
+  UPDATE page_schema
+     SET schema_json = jsonb_set(schema_json, '{floors}', '[]'::jsonb, true)
+   WHERE jsonb_typeof(schema_json) = 'object'
      AND jsonb_typeof(schema_json -> 'floors') IS DISTINCT FROM 'array';
-  IF skipped > 0 THEN
-    RAISE WARNING '012: % 条 published home 不是 floors 信封结构（可能由 seed.mjs 写入根级数组），已跳过影票楼层注入', skipped;
+  GET DIAGNOSTICS fixed2 = ROW_COUNT;
+
+  IF fixed > 0 OR fixed2 > 0 THEN
+    RAISE NOTICE '012: 自愈规范化 % 条根级数组 + % 条缺键首页为 page-v1 信封', fixed, fixed2;
   END IF;
 
+  -- ③ 注入影票楼层（严格面向信封；此后 041 约束保证不可能再出现非信封）
   UPDATE page_schema
      SET schema_json = jsonb_set(
            schema_json,
@@ -35,5 +57,5 @@ BEGIN
             WHERE f ->> 'type' = 'movie-box'
          );
   GET DIAGNOSTICS n = ROW_COUNT;
-  RAISE NOTICE '012: 影票楼层注入 % 行（跳过 % 行非信封结构）', n, skipped;
+  RAISE NOTICE '012: 影票楼层注入 % 行', n;
 END $$;

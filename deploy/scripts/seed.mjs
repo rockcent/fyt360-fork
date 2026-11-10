@@ -1,7 +1,9 @@
 // seed：初始数据（幂等 ON CONFLICT）
 // 范围 = M1 开工计划：159 业务入口 / 23 组件 / L1-L3 / 三角色 + 平台超管 / 示例站点 A
+import fs from 'node:fs';
+import path from 'node:path';
 import bcrypt from 'bcryptjs';
-import { loadDotEnv } from './lib/common.mjs';
+import { loadDotEnv, repoRoot } from './lib/common.mjs';
 import { connectDb } from './lib/db.mjs';
 import { categories } from '../seed/data-entries.mjs';
 import { components } from '../seed/data-components.mjs';
@@ -123,15 +125,23 @@ async function main() {
       console.warn('[seed] ADMIN_INIT_PASSWORD 未设置，跳过平台超管创建（deploy 阶段会强制要求）');
     }
 
-    // 8. 示例站点 A 默认首页 Schema（空壳渲染器消费）
+    // 8. 示例站点 A 默认首页 Schema
+    //    唯一内容真源 = packages/renderer/schema/default-home.json（page-v1 信封，7 层）
+    //    2026-11-10 修复：原此处硬编码根级数组 [{component_id,…}]，与 003/004 的
+    //    {"version","page","floors"} 信封及 page-v1.schema.json 合同冲突，导致 012 取
+    //    schema_json->'floors' 为 NULL → NOT NULL 违约、整条空库迁移链中断。
+    //    空库时 003/004 因 site 表尚无 site-a 而空转，§8 才是首页的实际写入者，
+    //    因此这里必须写对；真源缺失宁可 fail-fast，也不再写兜底空壳。
+    const homeDocPath = path.join(repoRoot, 'packages', 'renderer', 'schema', 'default-home.json');
+    if (!fs.existsSync(homeDocPath)) {
+      throw new Error(`首页真源缺失：${homeDocPath}（拒绝写入根级数组兜底）`);
+    }
+    const homeSchema = JSON.parse(fs.readFileSync(homeDocPath, 'utf8'));
+    if (!homeSchema || homeSchema.page !== 'home' || !Array.isArray(homeSchema.floors)) {
+      throw new Error('首页真源不符合 page-v1 信封合同：需 {version,page:"home",floors:[...]}');
+    }
     const { rows: siteRows } = await client.query(`SELECT site_id FROM site WHERE code = $1`, [sampleSite.code]);
     if (siteRows[0]) {
-      const homeSchema = [
-        { component_id: 'c1', floor_id: 'f_hero', type: 'swiper', props: { items: [], autoplay: true } },
-        { component_id: 'c2', floor_id: 'f_search', type: 'search-bar', props: { sticky: true } },
-        { component_id: 'c3', floor_id: 'f_nav', type: 'nav', props: { columns: 5, items: [] } },
-        { component_id: 'c4', floor_id: 'f_feed', type: 'goods-feed', props: { source: 'haojingke', tabSwitch: ['jd', 'tb', 'pdd', 'vip', 'self'] } },
-      ];
       await client.query(
         `INSERT INTO page_schema (site_id, page, schema_json, version, status, source)
          SELECT $1, 'home', $2::jsonb, 1, 'published', 'manual'
@@ -141,6 +151,7 @@ async function main() {
         [siteRows[0].site_id, JSON.stringify(homeSchema)]
       );
       stats.homeSchema = 1;
+      stats.homeFloors = homeSchema.floors.length;
     }
 
     if (inTx) await client.query('COMMIT');
