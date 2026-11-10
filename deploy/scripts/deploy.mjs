@@ -22,6 +22,12 @@ async function main() {
   console.log('[deploy] ===== 阶段 3/6 seed 初始数据（幂等） =====');
   run('node deploy/scripts/seed.mjs');
 
+  // 二次迁移：010/011/015/016 的数据轨是「对 seed 建好的品牌行做 UPDATE」，
+  // 首次部署时它们先于 seed 执行，命中 0 行且不报错（点餐插件轨会静默丢失）。
+  // 迁移本身幂等，seed 后再跑一遍即可补上。2026-11-10 空库复现后加入。
+  console.log('[deploy] ===== 阶段 3b/6 schema 复核（补数据轨，幂等） =====');
+  run('node deploy/scripts/migrate.mjs');
+
   console.log('[deploy] ===== 阶段 4/6 构建 + CloudBase 部署 =====');
   run('npm run build -w apps/admin');
   run('npm run build -w apps/h5');

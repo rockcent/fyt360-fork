@@ -102,11 +102,38 @@ marketingRouter.post('/coupons', requireAdmin, async (req: Request, res: Respons
   } catch (e) { next(e); }
 });
 
+/**
+ * 券归属校验（2026-11-10 安全修复）：写接口此前只按 id 定位，任何站点管理员都能
+ * 停用/删除他站券（coupon.id 为自增整数，可枚举）。这里统一走 assertSiteAccess，
+ * 与 GET/POST 的站点隔离口径对齐；平台超管按 role 放行。
+ */
+async function loadCouponOwnership(admin: AdminJwtPayload, id: number): Promise<{ siteId: string; issued: number }> {
+  const { rows } = await pool.query(
+    `SELECT site_id::text AS site_id, issued FROM coupon WHERE id = $1::bigint LIMIT 1`,
+    [id]
+  );
+  if (!rows[0]) throw new HttpError(404, '券不存在', 'COUPON_NOT_FOUND');
+  assertSiteAccess(admin, String(rows[0].site_id));
+  return { siteId: String(rows[0].site_id), issued: Number(rows[0].issued) };
+}
+
+function couponId(raw: string): number {
+  const id = Number(raw);
+  if (!Number.isInteger(id) || id <= 0) throw new HttpError(400, '券 id 非法', 'BAD_REQUEST');
+  return id;
+}
+
 /** PATCH /api/admin/marketing/coupons/:id {status} → 启用/停用 */
 marketingRouter.patch('/coupons/:id', requireAdmin, async (req: Request, res: Response, next: NextFunction) => {
   try {
+    const id = couponId(req.params.id);
+    const own = await loadCouponOwnership(req.admin!, id);
     const status = req.body?.status === 'disabled' ? 'disabled' : 'active';
-    const { rows } = await pool.query(`UPDATE coupon SET status = $2 WHERE id = $1 RETURNING id`, [Number(req.params.id), status]);
+    // WHERE 再带 site_id：即便归属在 SELECT 与 UPDATE 之间变化，也不会越界写
+    const { rows } = await pool.query(
+      `UPDATE coupon SET status = $2 WHERE id = $1::bigint AND site_id = $3::uuid RETURNING id`,
+      [id, status, own.siteId]
+    );
     if (!rows[0]) throw new HttpError(404, '券不存在', 'COUPON_NOT_FOUND');
     res.json({ ok: true, data: { id: Number(rows[0].id), status } });
   } catch (e) { next(e); }
@@ -115,11 +142,11 @@ marketingRouter.patch('/coupons/:id', requireAdmin, async (req: Request, res: Re
 /** DELETE /api/admin/marketing/coupons/:id → 删除（已发放的券禁止删除，只能停用） */
 marketingRouter.delete('/coupons/:id', requireAdmin, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { rows } = await pool.query(`SELECT issued FROM coupon WHERE id = $1::bigint LIMIT 1`, [Number(req.params.id)]);
-    if (!rows[0]) throw new HttpError(404, '券不存在', 'COUPON_NOT_FOUND');
-    if (Number(rows[0].issued) > 0) throw new HttpError(409, '已发放的券不可删除，请停用', 'COUPON_ISSUED');
-    await pool.query(`DELETE FROM coupon WHERE id = $1::bigint`, [Number(req.params.id)]);
-    res.json({ ok: true, data: { id: Number(req.params.id) } });
+    const id = couponId(req.params.id);
+    const own = await loadCouponOwnership(req.admin!, id);
+    if (own.issued > 0) throw new HttpError(409, '已发放的券不可删除，请停用', 'COUPON_ISSUED');
+    await pool.query(`DELETE FROM coupon WHERE id = $1::bigint AND site_id = $2::uuid`, [id, own.siteId]);
+    res.json({ ok: true, data: { id } });
   } catch (e) { next(e); }
 });
 

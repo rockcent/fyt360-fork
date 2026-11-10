@@ -7,6 +7,16 @@ import { categories } from '../seed/data-entries.mjs';
 import { components } from '../seed/data-components.mjs';
 import { memberLevels, roles, sampleSite } from '../seed/data-system.mjs';
 
+/** 列是否存在：同一份 seed 要同时适配 045 站点级化前后的 member_level */
+async function columnExists(client, table, column) {
+  const { rows } = await client.query(
+    `SELECT 1 FROM information_schema.columns
+      WHERE table_name = $1 AND column_name = $2 LIMIT 1`,
+    [table, column]
+  );
+  return rows.length > 0;
+}
+
 async function main() {
   loadDotEnv();
   const client = await connectDb();
@@ -51,18 +61,43 @@ async function main() {
     }
     stats.components = components.length;
 
-    // 4. 会员等级 L1/L2/L3（§11.2）
+    // 4. 示例站点 A（前移：045 站点级化之后 member_level 必须带 site_id）
+    const siteRes = await client.query(
+      `INSERT INTO site (code, name, theme, status) VALUES ($1,$2,$3::jsonb,'active')
+       ON CONFLICT (code) DO NOTHING
+       RETURNING site_id`,
+      [sampleSite.code, sampleSite.name, JSON.stringify(sampleSite.theme)]
+    );
+    stats.siteCreated = siteRes.rowCount;
+    const siteA = siteRes.rows[0]?.site_id
+      ?? (await client.query(`SELECT site_id FROM site WHERE code = $1`, [sampleSite.code])).rows[0]?.site_id;
+    if (!siteA) throw new Error('示例站点 A 缺失，无法写入会员等级');
+
+    // 5. 会员等级 L1/L2/L3（§11.2）
+    //    045 之前：code 全局唯一；045 之后：唯一键为 (site_id, code) 且 site_id NOT NULL。
+    //    这里按实际 schema 选择插入形态，保证同一份 seed 在新库与老库都能幂等跑通。
+    const levelHasSiteId = await columnExists(client, 'member_level', 'site_id');
     for (const lv of memberLevels) {
-      await client.query(
-        `INSERT INTO member_level (code, name, sort, ingot_price, self_rate, direct_rate, team_rate, team2_rate, "desc", status)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active')
-         ON CONFLICT (code) DO NOTHING`,
-        [lv.code, lv.name, lv.sort, lv.ingot_price, lv.self_rate, lv.direct_rate, lv.team_rate, lv.team2_rate, lv.desc]
-      );
+      if (levelHasSiteId) {
+        await client.query(
+          `INSERT INTO member_level (site_id, code, name, sort, ingot_price, self_rate, direct_rate, team_rate, team2_rate, "desc", status)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'active')
+           ON CONFLICT (site_id, code) DO NOTHING`,
+          [siteA, lv.code, lv.name, lv.sort, lv.ingot_price, lv.self_rate, lv.direct_rate, lv.team_rate, lv.team2_rate, lv.desc]
+        );
+      } else {
+        await client.query(
+          `INSERT INTO member_level (code, name, sort, ingot_price, self_rate, direct_rate, team_rate, team2_rate, "desc", status)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active')
+           ON CONFLICT (code) DO NOTHING`,
+          [lv.code, lv.name, lv.sort, lv.ingot_price, lv.self_rate, lv.direct_rate, lv.team_rate, lv.team2_rate, lv.desc]
+        );
+      }
     }
     stats.memberLevels = memberLevels.length;
+    stats.memberLevelSiteScoped = levelHasSiteId;
 
-    // 5. 内置角色
+    // 6. 内置角色
     for (const r of roles) {
       await client.query(
         `INSERT INTO role (role_code, name, permissions) VALUES ($1,$2,$3::jsonb)
@@ -71,15 +106,6 @@ async function main() {
       );
     }
     stats.roles = roles.length;
-
-    // 6. 示例站点 A
-    const siteRes = await client.query(
-      `INSERT INTO site (code, name, theme, status) VALUES ($1,$2,$3::jsonb,'active')
-       ON CONFLICT (code) DO NOTHING
-       RETURNING site_id`,
-      [sampleSite.code, sampleSite.name, JSON.stringify(sampleSite.theme)]
-    );
-    stats.siteCreated = siteRes.rowCount;
 
     // 7. 平台超管（密码取 ADMIN_INIT_PASSWORD，首次登录强制改密）
     //    重复执行不覆盖已改密码
